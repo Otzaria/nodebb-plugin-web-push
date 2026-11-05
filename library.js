@@ -14,10 +14,14 @@ const notifications = require.main.require('./src/notifications');
 
 const controllers = require('./lib/controllers');
 const subscriptions = require('./lib/subscriptions');
+const DeliveryQueue = require('./lib/delivery-queue');
 
 const routeHelpers = require.main.require('./src/routes/helpers');
 
 const plugin = {};
+const deliveryQueue = new DeliveryQueue();
+const recipientBatchSize = 100;
+const pushOptions = { timeout: 15000 };
 
 plugin.init = async (params) => {
 	const { router, middleware/* , controllers */ } = params;
@@ -107,7 +111,8 @@ plugin.addRoutes = async ({ router, middleware, helpers }) => {
 			bodyLong: 'This is a test message sent from NodeBB',
 			path: `/me/web-push`,
 		}, req.uid, userLang);
-		await webPush.sendNotification(subscription, JSON.stringify(payload));
+		await deliveryQueue.run([{ subscription, payload: JSON.stringify(payload) }], sendPush);
+		helpers.formatApiResponse(200, res);
 	});
 };
 
@@ -121,60 +126,78 @@ plugin.addAdminNavigation = (header) => {
 	return header;
 };
 
-plugin.onNotificationPush = async ({ notification, uidsNotified: uids }) => {
-	const subs = await subscriptions.list(uids);
-	uids = uids.filter(uid => subs.get(uid).size);
-	const userSettings = await user.getMultipleUserSettings(uids);
+plugin.onNotificationPush = ({ notification, uidsNotified: uids }) =>
+	deliveryQueue.run(notificationDeliveries(notification, uids), sendPush);
 
-	// Save recipients by nid (for use by .rescind)
+async function* notificationDeliveries(notification, uids) {
 	const refKey = `web-push:nid:${notification.mergeId || notification.nid}:uids`;
-	await db.setAdd(refKey, uids);
-	db.pexpire(refKey, 1000 * 60 * 60 * 48); // only track last 48 hours
+	for (let offset = 0; offset < uids.length; offset += recipientBatchSize) {
+		const batch = uids.slice(offset, offset + recipientBatchSize);
+		const subs = await subscriptions.list(batch);
+		const recipients = batch.filter(uid => subs.get(uid)?.size);
+		if (!recipients.length) {
+			continue;
+		}
+		const userSettings = await user.getMultipleUserSettings(recipients);
 
-	let payloads = await Promise.all(uids.map(async (uid, idx) => {
-		const payload = await constructPayload(notification, uid, userSettings[idx].userLang);
-		return [uid, payload];
-	}));
-	payloads = new Map(payloads);
+		// Save recipients by nid (for use by .rescind). Include expiry in completion.
+		await db.setAdd(refKey, recipients);
+		await db.pexpire(refKey, 1000 * 60 * 60 * 48);
 
-	payloads.forEach((payload, uid) => {
-		const targets = subs.get(uid);
-		targets.forEach(async (subscription) => {
-			try {
-				await webPush.sendNotification(subscription, JSON.stringify(payload));
-			} catch (e) {
-				// Errored — remove subscription from user
-				winston.info(`[plugins/web-push] Push failed: ${e.code}; ${e.message}; statusCode: ${e.statusCode}`);
-				// subscriptions.remove(uid, subscription);
+		for (let idx = 0; idx < recipients.length; idx += 1) {
+			const uid = recipients[idx];
+			const payload = JSON.stringify(await constructPayload(notification, uid, userSettings[idx].userLang));
+			for (const subscription of subs.get(uid)) {
+				yield { uid, subscription, payload };
 			}
-		});
-	});
-};
+		}
+	}
+}
 
-plugin.onNotificationRescind = async ({ nids }) => {
+plugin.onNotificationRescind = ({ nids }) =>
+	deliveryQueue.run(rescindDeliveries(nids), sendPush);
+
+async function* rescindDeliveries(nids) {
 	const notificationKeys = nids.map(nid => `notifications:${nid}`);
-	let mergeIds = await db.getObjectsFields(notificationKeys, ['mergeId']);
-	mergeIds = mergeIds.map(o => o.mergeId);
+	const notifications = await db.getObjectsFields(notificationKeys, ['mergeId']);
 
 	// Favour mergeIds over nids, then eliminate dupes
-	const tags = new Set(notificationKeys.map((key, i) => mergeIds[i] || key));
-	const recipients = await db.getSetsMembers(Array.from(tags).map(tag => `web-push:nid:${tag}:uids`));
-
-	Promise.all(Array.from(tags).map(async (tag, idx) => {
-		let subs = await subscriptions.list(recipients[idx]);
-		subs = new Set(...Object.values(Object.fromEntries(subs))); // wtf
-
-		if (subs.size) {
-			await Promise.all(Array.from(subs).map(async (subscription) => {
-				try {
-					await webPush.sendNotification(subscription, JSON.stringify({ tag }));
-				} catch (e) {
-					winston.info(`[plugins/web-push] Push failed: ${e.code}; ${e.message}; statusCode: ${e.statusCode}`);
+	const tags = Array.from(new Set(nids.map((nid, idx) => notifications[idx]?.mergeId || nid)));
+	for (const tag of tags) {
+		const [recipients] = await db.getSetsMembers([`web-push:nid:${tag}:uids`]);
+		const payload = JSON.stringify({ tag });
+		for (let offset = 0; offset < recipients.length; offset += recipientBatchSize) {
+			const subs = await subscriptions.list(recipients.slice(offset, offset + recipientBatchSize));
+			for (const [uid, targets] of subs) {
+				for (const subscription of targets) {
+					yield { uid, subscription, payload };
 				}
-			}));
+			}
 		}
-	})).catch(err => winston.error(err.stack));
-};
+	}
+}
+
+async function sendPush({ uid, subscription, payload }) {
+	try {
+		// web-push destroys the request on socket timeout; keep the queue slot
+		// until its promise settles instead of racing an uncancelled request.
+		await webPush.sendNotification(subscription, payload, pushOptions);
+	} catch (error) {
+		if (uid === undefined) { // The test route reports send errors to its caller.
+			throw error;
+		}
+		winston.info(`[plugins/web-push] Push failed: ${error.code}; ${error.message}; statusCode: ${error.statusCode}`);
+		// Only the push service's explicit expiry responses invalidate a subscription.
+		// Network failures, rate limits and server failures may be retried later.
+		if (error.statusCode === 404 || error.statusCode === 410) {
+			try {
+				await subscriptions.remove(uid, subscription);
+			} catch (cleanupError) {
+				winston.error(`[plugins/web-push] Subscription cleanup failed: ${cleanupError.message}`);
+			}
+		}
+	}
+}
 
 plugin.addProfileItem = (data) => {
 	data.links.push({
